@@ -1,0 +1,365 @@
+diff --git a/drivers/gles3/gl46_canvas_buffer.cpp b/drivers/gles3/gl46_canvas_buffer.cpp
+new file mode 100644
+index 0000000..6eb361a
+--- /dev/null
++++ b/drivers/gles3/gl46_canvas_buffer.cpp
+@@ -0,0 +1,88 @@
++#include "gl46_canvas_buffer.h"
++
++#ifdef GLES3_ENABLED
++#include "core/string/print_string.h"
++#include "core/string/ustring.h"
++#include "core/variant/variant.h"
++
++#ifdef WINDOWS_ENABLED
++#include <windows.h>
++
++namespace {
++using CreateBuffers = void(APIENTRY *)(GLsizei, GLuint *);
++using NamedBufferStorage = void(APIENTRY *)(GLuint, GLsizeiptr, const void *, GLbitfield);
++using MapNamedBufferRange = void *(APIENTRY *)(GLuint, GLintptr, GLsizeiptr, GLbitfield);
++using UnmapNamedBuffer = GLboolean(APIENTRY *)(GLuint);
++CreateBuffers create_buffers = nullptr;
++NamedBufferStorage named_buffer_storage = nullptr;
++MapNamedBufferRange map_named_buffer_range = nullptr;
++UnmapNamedBuffer unmap_named_buffer = nullptr;
++// ARB_buffer_storage, core since OpenGL 4.4.
++constexpr GLbitfield MAP_PERSISTENT = 0x0040;
++constexpr GLbitfield MAP_COHERENT = 0x0080;
++}
++#endif
++
++bool GL46CanvasBuffer::initialize() {
++#ifdef WINDOWS_ENABLED
++	const char *version = reinterpret_cast<const char *>(glGetString(GL_VERSION));
++	if (!version || String(version).begins_with("OpenGL ES")) {
++		return false;
++	}
++	GLint major = 0;
++	GLint minor = 0;
++	glGetIntegerv(GL_MAJOR_VERSION, &major);
++	glGetIntegerv(GL_MINOR_VERSION, &minor);
++	if (major < 4 || (major == 4 && minor < 6)) {
++		return false;
++	}
++	// Load only the four desktop entry points; do not alter the shared GLES loader.
++	HMODULE library = GetModuleHandleW(L"opengl32.dll");
++	using GetProc = PROC(WINAPI *)(LPCSTR);
++	GetProc get_proc = library ? reinterpret_cast<GetProc>(GetProcAddress(library, "wglGetProcAddress")) : nullptr;
++	if (!get_proc) {
++		return false;
++	}
++	auto load = [get_proc](const char *p_name) -> PROC {
++		PROC entry = get_proc(p_name);
++		uintptr_t value = reinterpret_cast<uintptr_t>(entry);
++		return value <= 3 || value == UINTPTR_MAX ? nullptr : entry;
++	};
++	create_buffers = reinterpret_cast<CreateBuffers>(load("glCreateBuffers"));
++	named_buffer_storage = reinterpret_cast<NamedBufferStorage>(load("glNamedBufferStorage"));
++	map_named_buffer_range = reinterpret_cast<MapNamedBufferRange>(load("glMapNamedBufferRange"));
++	unmap_named_buffer = reinterpret_cast<UnmapNamedBuffer>(load("glUnmapNamedBuffer"));
++	return create_buffers && named_buffer_storage && map_named_buffer_range && unmap_named_buffer;
++#else
++	return false;
++#endif
++}
++
++uint8_t *GL46CanvasBuffer::create(GLuint &r_buffer, uint32_t p_size) {
++#ifdef WINDOWS_ENABLED
++	create_buffers(1, &r_buffer);
++	const GLbitfield flags = GL_MAP_WRITE_BIT | MAP_PERSISTENT | MAP_COHERENT;
++	named_buffer_storage(r_buffer, p_size, nullptr, flags);
++	uint8_t *mapping = static_cast<uint8_t *>(map_named_buffer_range(r_buffer, 0, p_size, flags));
++	if (!mapping) {
++		glDeleteBuffers(1, &r_buffer);
++		r_buffer = 0;
++		return nullptr;
++	}
++	static bool reported = false;
++	if (!reported) {
++		print_line("TL_GL46: DSA immutable storage + persistent coherent canvas instance buffers active");
++		reported = true;
++	}
++	return mapping;
++#else
++	return nullptr;
++#endif
++}
++
++void GL46CanvasBuffer::unmap(GLuint p_buffer) {
++#ifdef WINDOWS_ENABLED
++	unmap_named_buffer(p_buffer);
++#endif
++}
++#endif
+diff --git a/drivers/gles3/gl46_canvas_buffer.h b/drivers/gles3/gl46_canvas_buffer.h
+new file mode 100644
+index 0000000..cafc86e
+--- /dev/null
++++ b/drivers/gles3/gl46_canvas_buffer.h
+@@ -0,0 +1,14 @@
++#pragma once
++
++#ifdef GLES3_ENABLED
++#include <cstdint>
++#include <platform_gl.h>
++
++// Desktop-only streaming storage. GLES/ANGLE retain the existing allocation path.
++class GL46CanvasBuffer {
++public:
++	static bool initialize();
++	static uint8_t *create(GLuint &r_buffer, uint32_t p_size);
++	static void unmap(GLuint p_buffer);
++};
++#endif
+diff --git a/drivers/gles3/rasterizer_canvas_gles3.cpp b/drivers/gles3/rasterizer_canvas_gles3.cpp
+index 3b57052..9bd4fda 100644
+--- a/drivers/gles3/rasterizer_canvas_gles3.cpp
++++ b/drivers/gles3/rasterizer_canvas_gles3.cpp
+@@ -37,6 +37,7 @@
+ #include "core/math/geometry_2d.h"
+ #include "core/math/transform_interpolator.h"
+ #include "drivers/gles3/rasterizer_util_gles3.h"
++#include "drivers/gles3/gl46_canvas_buffer.h"
+ #include "drivers/gles3/storage/config.h"
+ #include "drivers/gles3/storage/mesh_storage.h"
+ #include "drivers/gles3/storage/particles_storage.h"
+@@ -121,13 +122,24 @@ void RasterizerCanvasGLES3::canvas_render_items(RID p_to_render_target, Item *p_
+ 		if (syncStatus == GL_UNSIGNALED) {
+ 			// If older than 2 frames, wait for sync OpenGL can have up to 3 frames in flight, any more and we need to sync anyway.
+ 			if (state.canvas_instance_data_buffers[state.current_data_buffer_index].last_frame_used < RSG::rasterizer->get_frame_number() - 2) {
++				bool can_reuse = true;
+ #ifndef WEB_ENABLED
+ 				// On web, we do nothing as the glSubBufferData will force a sync anyway and WebGL does not like waiting.
+-				glClientWaitSync(state.canvas_instance_data_buffers[state.current_data_buffer_index].fence, 0, 100000000); // wait for up to 100ms
++				GLenum wait_status = glClientWaitSync(state.canvas_instance_data_buffers[state.current_data_buffer_index].fence, GL_SYNC_FLUSH_COMMANDS_BIT, 100000000);
++				if (wait_status == GL_TIMEOUT_EXPIRED) {
++					// A coherent CPU mapping does not make overwriting in-flight data safe.
++					_allocate_instance_data_buffer();
++					can_reuse = false;
++				} else if (wait_status == GL_WAIT_FAILED) {
++					ERR_PRINT("Canvas buffer fence wait failed; synchronizing before reuse.");
++					glFinish();
++				}
+ #endif
+-				state.canvas_instance_data_buffers[state.current_data_buffer_index].last_frame_used = RSG::rasterizer->get_frame_number();
+-				glDeleteSync(state.canvas_instance_data_buffers[state.current_data_buffer_index].fence);
+-				state.canvas_instance_data_buffers[state.current_data_buffer_index].fence = GLsync();
++				if (can_reuse) {
++					state.canvas_instance_data_buffers[state.current_data_buffer_index].last_frame_used = RSG::rasterizer->get_frame_number();
++					glDeleteSync(state.canvas_instance_data_buffers[state.current_data_buffer_index].fence);
++					state.canvas_instance_data_buffers[state.current_data_buffer_index].fence = GLsync();
++				}
+ 			} else {
+ 				// Used in last frame or frame before that. OpenGL can get up to two frames behind, so these buffers may still be in use
+ 				// Allocate a new buffer and use that.
+@@ -667,15 +679,7 @@ void RasterizerCanvasGLES3::_render_items(RID p_to_render_target, int p_item_cou
+ 	}
+ 
+ 	// Copy over all data needed for rendering.
+-	glBindBuffer(GL_ARRAY_BUFFER, state.canvas_instance_data_buffers[state.current_data_buffer_index].instance_buffers[state.current_instance_buffer_index]);
+-#ifdef WEB_ENABLED
+-	glBufferSubData(GL_ARRAY_BUFFER, state.last_item_index * sizeof(InstanceData), sizeof(InstanceData) * index, state.instance_data_array);
+-#else
+-	// On Desktop and mobile we map the memory without synchronizing for maximum speed.
+-	void *buffer = glMapBufferRange(GL_ARRAY_BUFFER, state.last_item_index * sizeof(InstanceData), index * sizeof(InstanceData), GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+-	memcpy(buffer, state.instance_data_array, index * sizeof(InstanceData));
+-	glUnmapBuffer(GL_ARRAY_BUFFER);
+-#endif
++	_upload_instance_data(index);
+ 
+ 	glDisable(GL_SCISSOR_TEST);
+ 	current_clip = nullptr;
+@@ -1550,15 +1554,7 @@ void RasterizerCanvasGLES3::_add_to_batch(uint32_t &r_index, bool &r_batch_broke
+ 	if (r_index + state.last_item_index >= data.max_instances_per_buffer) {
+ 		// Copy over all data needed for rendering right away
+ 		// then go back to recording item commands.
+-		glBindBuffer(GL_ARRAY_BUFFER, state.canvas_instance_data_buffers[state.current_data_buffer_index].instance_buffers[state.current_instance_buffer_index]);
+-#ifdef WEB_ENABLED
+-		glBufferSubData(GL_ARRAY_BUFFER, state.last_item_index * sizeof(InstanceData), sizeof(InstanceData) * r_index, state.instance_data_array);
+-#else
+-		// On Desktop and mobile we map the memory without synchronizing for maximum speed.
+-		void *buffer = glMapBufferRange(GL_ARRAY_BUFFER, state.last_item_index * sizeof(InstanceData), r_index * sizeof(InstanceData), GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+-		memcpy(buffer, state.instance_data_array, r_index * sizeof(InstanceData));
+-		glUnmapBuffer(GL_ARRAY_BUFFER);
+-#endif
++		_upload_instance_data(r_index);
+ 		_allocate_instance_buffer();
+ 		r_index = 0;
+ 		state.last_item_index = 0;
+@@ -2594,9 +2590,8 @@ void RasterizerCanvasGLES3::free_polygon(PolygonID p_polygon) {
+ void RasterizerCanvasGLES3::_allocate_instance_data_buffer() {
+ 	GLuint new_buffers[3];
+ 	glGenBuffers(3, new_buffers);
+-	// Batch UBO.
+-	glBindBuffer(GL_ARRAY_BUFFER, new_buffers[0]);
+-	GLES3::Utilities::get_singleton()->buffer_allocate_data(GL_ARRAY_BUFFER, new_buffers[0], data.max_instance_buffer_size, nullptr, GL_STREAM_DRAW, "2D Batch UBO[" + itos(state.current_data_buffer_index) + "][0]");
++	// The instance buffer uses its own storage strategy.
++	glDeleteBuffers(1, &new_buffers[0]);
+ 	// Light uniform buffer.
+ 	glBindBuffer(GL_UNIFORM_BUFFER, new_buffers[1]);
+ 	GLES3::Utilities::get_singleton()->buffer_allocate_data(GL_UNIFORM_BUFFER, new_buffers[1], sizeof(LightUniform) * data.max_lights_per_render, nullptr, GL_STREAM_DRAW, "2D Lights UBO[" + itos(state.current_data_buffer_index) + "]");
+@@ -2606,7 +2601,7 @@ void RasterizerCanvasGLES3::_allocate_instance_data_buffer() {
+ 
+ 	state.current_data_buffer_index = (state.current_data_buffer_index + 1);
+ 	DataBuffer db;
+-	db.instance_buffers.push_back(new_buffers[0]);
++	_create_instance_buffer(db);
+ 	db.light_ubo = new_buffers[1];
+ 	db.state_ubo = new_buffers[2];
+ 	db.last_frame_used = RSG::rasterizer->get_frame_number();
+@@ -2623,15 +2618,51 @@ void RasterizerCanvasGLES3::_allocate_instance_buffer() {
+ 		return;
+ 	}
+ 
+-	GLuint new_buffer;
+-	glGenBuffers(1, &new_buffer);
++	_create_instance_buffer(state.canvas_instance_data_buffers[state.current_data_buffer_index]);
+ 
+-	glBindBuffer(GL_ARRAY_BUFFER, new_buffer);
+-	GLES3::Utilities::get_singleton()->buffer_allocate_data(GL_ARRAY_BUFFER, new_buffer, data.max_instance_buffer_size, nullptr, GL_STREAM_DRAW, "Batch UBO[" + itos(state.current_data_buffer_index) + "][" + itos(state.canvas_instance_data_buffers[state.current_data_buffer_index].instance_buffers.size()) + "]");
++	glBindBuffer(GL_ARRAY_BUFFER, 0);
++}
+ 
+-	state.canvas_instance_data_buffers[state.current_data_buffer_index].instance_buffers.push_back(new_buffer);
++void RasterizerCanvasGLES3::_create_instance_buffer(DataBuffer &r_buffer) {
++	GLuint buffer = 0;
++	uint8_t *mapping = persistent_canvas_buffers ? GL46CanvasBuffer::create(buffer, data.max_instance_buffer_size) : nullptr;
++	if (mapping) {
++		GLES3::Utilities::get_singleton()->buffer_register_allocation(buffer, data.max_instance_buffer_size, "GL46 canvas instance storage");
++	} else {
++		if (persistent_canvas_buffers) {
++			WARN_PRINT_ONCE("Persistent canvas allocation failed; using mapped streaming for this buffer.");
++		}
++		glGenBuffers(1, &buffer);
++		glBindBuffer(GL_ARRAY_BUFFER, buffer);
++		GLES3::Utilities::get_singleton()->buffer_allocate_data(GL_ARRAY_BUFFER, buffer, data.max_instance_buffer_size, nullptr, GL_STREAM_DRAW, "Canvas instance storage");
++	}
++	r_buffer.instance_buffers.push_back(buffer);
++	r_buffer.instance_mappings.push_back(mapping);
++}
+ 
+-	glBindBuffer(GL_ARRAY_BUFFER, 0);
++void RasterizerCanvasGLES3::_upload_instance_data(uint32_t p_count) {
++	if (p_count == 0) {
++		return;
++	}
++	DataBuffer &buffer = state.canvas_instance_data_buffers[state.current_data_buffer_index];
++	uint32_t offset = state.last_item_index * sizeof(InstanceData);
++	uint32_t size = p_count * sizeof(InstanceData);
++	ERR_FAIL_COND(offset > data.max_instance_buffer_size || size > data.max_instance_buffer_size - offset);
++	uint8_t *mapping = buffer.instance_mappings[state.current_instance_buffer_index];
++	if (mapping) {
++		// Coherent writes become visible to subsequent draws without map/unmap calls.
++		memcpy(mapping + offset, state.instance_data_array, size);
++		return;
++	}
++	glBindBuffer(GL_ARRAY_BUFFER, buffer.instance_buffers[state.current_instance_buffer_index]);
++#ifdef WEB_ENABLED
++	glBufferSubData(GL_ARRAY_BUFFER, offset, size, state.instance_data_array);
++#else
++	void *temporary = glMapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
++	ERR_FAIL_NULL(temporary);
++	memcpy(temporary, state.instance_data_array, size);
++	glUnmapBuffer(GL_ARRAY_BUFFER);
++#endif
+ }
+ 
+ void RasterizerCanvasGLES3::set_time(double p_time) {
+@@ -2646,6 +2677,8 @@ RasterizerCanvasGLES3 *RasterizerCanvasGLES3::get_singleton() {
+ 
+ RasterizerCanvasGLES3::RasterizerCanvasGLES3() {
+ 	singleton = this;
++	bool enable_persistent = GLOBAL_DEF_RST("rendering/gl_compatibility/persistent_canvas_buffers", true);
++	persistent_canvas_buffers = enable_persistent && GL46CanvasBuffer::initialize();
+ 	GLES3::TextureStorage *texture_storage = GLES3::TextureStorage::get_singleton();
+ 	GLES3::MaterialStorage *material_storage = GLES3::MaterialStorage::get_singleton();
+ 	GLES3::Config *config = GLES3::Config::get_singleton();
+@@ -2789,9 +2822,7 @@ RasterizerCanvasGLES3::RasterizerCanvasGLES3() {
+ 	for (int i = 0; i < 3; i++) {
+ 		GLuint new_buffers[3];
+ 		glGenBuffers(3, new_buffers);
+-		// Batch UBO.
+-		glBindBuffer(GL_ARRAY_BUFFER, new_buffers[0]);
+-		GLES3::Utilities::get_singleton()->buffer_allocate_data(GL_ARRAY_BUFFER, new_buffers[0], data.max_instance_buffer_size, nullptr, GL_STREAM_DRAW, "Batch UBO[0][0]");
++		glDeleteBuffers(1, &new_buffers[0]);
+ 		// Light uniform buffer.
+ 		glBindBuffer(GL_UNIFORM_BUFFER, new_buffers[1]);
+ 		GLES3::Utilities::get_singleton()->buffer_allocate_data(GL_UNIFORM_BUFFER, new_buffers[1], sizeof(LightUniform) * data.max_lights_per_render, nullptr, GL_STREAM_DRAW, "2D lights UBO[0]");
+@@ -2799,7 +2830,7 @@ RasterizerCanvasGLES3::RasterizerCanvasGLES3() {
+ 		glBindBuffer(GL_UNIFORM_BUFFER, new_buffers[2]);
+ 		GLES3::Utilities::get_singleton()->buffer_allocate_data(GL_UNIFORM_BUFFER, new_buffers[2], sizeof(StateBuffer), nullptr, GL_STREAM_DRAW, "2D state UBO[0]");
+ 		DataBuffer db;
+-		db.instance_buffers.push_back(new_buffers[0]);
++		_create_instance_buffer(db);
+ 		db.light_ubo = new_buffers[1];
+ 		db.state_ubo = new_buffers[2];
+ 		db.last_frame_used = 0;
+@@ -2923,8 +2954,14 @@ RasterizerCanvasGLES3::~RasterizerCanvasGLES3() {
+ 	}
+ 
+ 	for (uint32_t i = 0; i < state.canvas_instance_data_buffers.size(); i++) {
++		if (state.canvas_instance_data_buffers[i].fence) {
++			glDeleteSync(state.canvas_instance_data_buffers[i].fence);
++		}
+ 		for (int j = 0; j < state.canvas_instance_data_buffers[i].instance_buffers.size(); j++) {
+ 			if (state.canvas_instance_data_buffers[i].instance_buffers[j]) {
++				if (state.canvas_instance_data_buffers[i].instance_mappings[j]) {
++					GL46CanvasBuffer::unmap(state.canvas_instance_data_buffers[i].instance_buffers[j]);
++				}
+ 				GLES3::Utilities::get_singleton()->buffer_free_data(state.canvas_instance_data_buffers[i].instance_buffers[j]);
+ 			}
+ 		}
+diff --git a/drivers/gles3/rasterizer_canvas_gles3.h b/drivers/gles3/rasterizer_canvas_gles3.h
+index 6874d5d..6b73783 100644
+--- a/drivers/gles3/rasterizer_canvas_gles3.h
++++ b/drivers/gles3/rasterizer_canvas_gles3.h
+@@ -283,6 +283,7 @@ public:
+ 	// to avoid the GPU stalling to wait for a resource to become available.
+ 	struct DataBuffer {
+ 		Vector<GLuint> instance_buffers;
++		Vector<uint8_t *> instance_mappings;
+ 		GLuint light_ubo = 0;
+ 		GLuint state_ubo = 0;
+ 		uint64_t last_frame_used = -3;
+@@ -364,6 +365,9 @@ public:
+ 	void _add_to_batch(uint32_t &r_index, bool &r_batch_broken);
+ 	void _allocate_instance_data_buffer();
+ 	void _allocate_instance_buffer();
++	void _create_instance_buffer(DataBuffer &r_buffer);
++	void _upload_instance_data(uint32_t p_count);
++	bool persistent_canvas_buffers = false;
+ 	void _enable_attributes(uint32_t p_start, bool p_primitive, uint32_t p_rate = 1);
+ 
+ 	void set_time(double p_time);
+diff --git a/drivers/gles3/storage/utilities.h b/drivers/gles3/storage/utilities.h
+index a0b953b..a269b77 100644
+--- a/drivers/gles3/storage/utilities.h
++++ b/drivers/gles3/storage/utilities.h
+@@ -84,6 +84,11 @@ public:
+ 	// Allocate memory with glBufferData. Does not handle resizing.
+ 	_FORCE_INLINE_ void buffer_allocate_data(GLenum p_target, GLuint p_id, uint32_t p_size, const void *p_data, GLenum p_usage, String p_name = "") {
+ 		glBufferData(p_target, p_size, p_data, p_usage);
++		buffer_register_allocation(p_id, p_size, p_name);
++	}
++
++	// Also used for storage created through desktop immutable/DSA entry points.
++	_FORCE_INLINE_ void buffer_register_allocation(GLuint p_id, uint32_t p_size, String p_name = "") {
+ 		buffer_mem_cache += p_size;
+ 
+ #ifdef DEV_ENABLED
+diff --git a/platform/windows/gl_manager_windows_native.cpp b/platform/windows/gl_manager_windows_native.cpp
+index 3323be1..78fe688 100644
+--- a/platform/windows/gl_manager_windows_native.cpp
++++ b/platform/windows/gl_manager_windows_native.cpp
+@@ -380,8 +380,8 @@ Error GLManagerNative_Windows::_create_context(GLWindow &win, GLDisplay &gl_disp
+ 	}
+ 
+ 	int attribs[] = {
+-		WGL_CONTEXT_MAJOR_VERSION_ARB, 3, //we want a 3.3 context
+-		WGL_CONTEXT_MINOR_VERSION_ARB, 3,
++		WGL_CONTEXT_MAJOR_VERSION_ARB, 4, // Technology Laboratory desktop baseline.
++		WGL_CONTEXT_MINOR_VERSION_ARB, 6,
+ 		//and it shall be forward compatible so that we can only use up to date functionality
+ 		WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+ 		WGL_CONTEXT_FLAGS_ARB, WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB /*| _WGL_CONTEXT_DEBUG_BIT_ARB*/,

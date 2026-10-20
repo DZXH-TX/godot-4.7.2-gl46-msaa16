@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/godotengine/godot.git",
+  "tag": "4.7.2-stable",
+  "commit": "ed1daf0bf001b61586d9930840f2f1394092c079",
+  "patches": ["godot-4.7.2-gl46.patch", "godot-4.7.2-msaa16.patch"],
+  "scons": "4.11.1",
+  "accesskit": "0.22.3",
+  "managed_bundle": "https://github.com/godotengine/godot-builds/releases/download/4.7.2-stable/Godot_v4.7.2-stable_mono_win64.zip"
+}
